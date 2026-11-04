@@ -1,0 +1,95 @@
+name: Mirror upstream (code + releases)
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-upstream
+  cancel-in-progress: false
+
+env:
+  UP: YUANGEGE1234/xinyuan
+  UP_URL: https://github.com/YUANGEGE1234/xinyuan.git
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync branches and tags
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UP_URL" 2>/dev/null || git remote set-url upstream "$UP_URL"
+          git fetch upstream --tags --prune --force
+          git push origin --tags --force
+          echo "tags now: $(git tag | wc -l)"
+
+      - name: Sync release notes and assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SELF: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/asset
+          gh api "repos/$UP/releases?per_page=100" --paginate > /tmp/up.json
+          N=$(jq 'length' /tmp/up.json)
+          echo "upstream releases: $N"
+
+          for i in $(seq 0 $((N-1))); do
+            TAG=$(jq -r ".[$i].tag_name" /tmp/up.json)
+            NAME=$(jq -r ".[$i].name // .[$i].tag_name" /tmp/up.json)
+            DRAFT=$(jq -r ".[$i].draft" /tmp/up.json)
+            PRE=$(jq -r ".[$i].prerelease" /tmp/up.json)
+            echo "== $TAG"
+
+            jq -r ".[$i].body // \"\"" /tmp/up.json > /tmp/body.md
+
+            if gh release view "$TAG" -R "$SELF" >/dev/null 2>&1; then
+              echo "  exists, patching assets only"
+            else
+              gh release create "$TAG" -R "$SELF" \
+                --title "$NAME" --notes-file /tmp/body.md \
+                $( [ "$DRAFT" = true ] && echo --draft ) \
+                $( [ "$PRE" = true ] && echo --prerelease )
+              echo "  created"
+            fi
+
+            NA=$(jq ".[$i].assets | length" /tmp/up.json)
+            for a in $(seq 0 $((NA-1))); do
+              AN=$(jq -r ".[$i].assets[$a].name" /tmp/up.json)
+              AS=$(jq -r ".[$i].assets[$a].size" /tmp/up.json)
+              have=$(gh release view "$TAG" -R "$SELF" --json assets -q '.assets[].name' 2>/dev/null | grep -Fx "$AN" || true)
+              if [ -n "$have" ]; then echo "  $AN already present"; continue; fi
+              echo "  downloading $AN ($(awk -v s=$AS 'BEGIN{printf "%.1f",s/1048576}') MB)"
+              gh release download "$TAG" -R "$UP" -p "$AN" -D /tmp/asset --clobber
+              gh release upload "$TAG" "/tmp/asset/$AN" -R "$SELF" --clobber
+              rm -f "/tmp/asset/$AN"
+            done
+          done
+
+      - name: Summary
+        run: |
+          {
+            echo "### Mirror complete"
+            echo ""
+            echo "- upstream: \`$UP\`"
+            echo "- at: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo ""
+            echo '```'
+            gh release list -R "${{ github.repository }}" || true
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
